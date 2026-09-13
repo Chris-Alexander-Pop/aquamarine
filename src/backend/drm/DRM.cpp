@@ -69,6 +69,8 @@ Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_) 
             restoreAfterVT();
         } else
             for (const auto& connector : connectors) {
+                if (!connector)
+                    continue;
                 if (connector->output)
                     cancelAsyncOutput(connector->output.get(), true);
                 connector->invalidateFrame();
@@ -484,13 +486,18 @@ void Aquamarine::CDRMBackend::cancelAsyncOutput(CDRMOutput* output, bool renewOw
 }
 
 void Aquamarine::CDRMBackend::emitAsyncCommitEvent(SP<CDRMOutput> output) {
-    if (!output || !output->asyncCommitEventPending)
+    auto* out = output.get();
+    if (!out || !out->asyncCommitEventPending)
         return;
 
-    output->asyncCommitEventPending = false;
+    out->asyncCommitEventPending = false;
     if (m_pendingAsyncCommitEvents > 0)
         --m_pendingAsyncCommitEvents;
-    output->events.commit.emit();
+
+    // ~CDRMBackend resets connector SPs as it walks the vector. Emitting into a
+    // disconnecting output (or after Hyprland has dropped listeners) is a NULL deref.
+    if (out->connector && out->connector->status == DRM_MODE_CONNECTED)
+        out->events.commit.emit();
 
     if (m_pendingAsyncCommitEvents == 0)
         dispatchCommitResults();
@@ -3181,8 +3188,10 @@ Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const
     asyncCommitEventPending = true;
     ++backend->m_pendingAsyncCommitEvents;
     backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([output = self, drmBackend = backend] {
-        if (const auto OUTPUT = output.lock(); OUTPUT && drmBackend)
-            drmBackend->emitAsyncCommitEvent(OUTPUT);
+        const auto OUTPUT  = output.lock();
+        const auto BACKEND = drmBackend.lock();
+        if (OUTPUT && BACKEND)
+            BACKEND->emitAsyncCommitEvent(OUTPUT);
     }));
 
     return {.id = *COMMIT_ID};

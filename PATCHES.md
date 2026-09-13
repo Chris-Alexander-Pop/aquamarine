@@ -2,11 +2,9 @@
 
 This branch tracks [hyprwm/aquamarine](https://github.com/hyprwm/aquamarine) `main` with a small set of personal fixes on top.
 
-No functional patches yet. The branch exists so DRM / hotplug work can land here instead of waiting on Arch `extra/aquamarine`.
-
 | Commit | Summary |
 |--------|---------|
-| *(none)* | |
+| `drm: guard async commit emit during teardown` | Upstream null-checks connectors in `flushAsyncCommitEvents`. This still skips empty connector SPs on VT switch, skips the commit signal when the connector is disconnected, and `lock()`s the backend in the idle callback so it does not run during teardown. |
 
 ## Updating from upstream
 
