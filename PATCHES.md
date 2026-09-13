@@ -2,11 +2,9 @@
 
 This branch tracks [hyprwm/aquamarine](https://github.com/hyprwm/aquamarine) `main` with a small set of personal fixes on top.
 
-No functional patches yet. The branch exists so DRM / hotplug work can land here instead of waiting on Arch `extra/aquamarine`.
-
 | Commit | Summary |
 |--------|---------|
-| *(none)* | |
+| `drm: skip null connectors when flushing async commits` | `~CDRMBackend` resets connector SPs as it walks the vector, then `cancelAsyncOutput` flushes the whole list. `connector->output` on an empty SP is a NULL deref (Hyprland SIGSEGV in `flushAsyncCommitEvents` / `emitAsyncCommitEvent`). Idle commit callbacks now `lock()` the backend so they do not run during teardown. |
 
 ## Updating from upstream
 
