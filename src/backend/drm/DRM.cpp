@@ -1414,6 +1414,7 @@ uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connecto
     pendingFlip.async       = async;
     pendingFlip.commitID    = commitID;
     pendingFlip.resultReady = resultReady;
+    pendingFlip.armedAtNs   = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     pendingFlip.early.valid = false;
 
     return pendingFlip.id.value();
@@ -1425,6 +1426,7 @@ void Aquamarine::SDRMCRTC::disarmPageFlip() {
     pendingFlip.async       = false;
     pendingFlip.commitID    = 0;
     pendingFlip.resultReady = true;
+    pendingFlip.armedAtNs   = 0;
     pendingFlip.early.valid = false;
 }
 
@@ -2619,8 +2621,17 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         }
 
         if (STATE.enabled && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER) && connector->sched.frameInFlight()) {
-            backend->backend->log(AQ_LOG_ERROR, "drm: Cannot commit when a page-flip is awaiting");
-            return false;
+            const uint64_t armed = connector->crtc ? connector->crtc->pendingFlip.armedAtNs : 0;
+            const uint64_t now   = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            // A flip that never comes back (cross-GPU fence waited on the scanout queue)
+            // used to reject every later commit. Drop it and let this one proceed.
+            if (armed && now > armed && (now - armed) > 1000000000ULL) {
+                backend->backend->log(AQ_LOG_ERROR, std::format("drm: page-flip on {} stuck for {}ms, dropping it", name, (now - armed) / 1000000));
+                connector->invalidateFrame();
+            } else {
+                backend->backend->log(AQ_LOG_ERROR, "drm: Cannot commit when a page-flip is awaiting");
+                return false;
+            }
         }
 
         if (STATE.enabled && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER))

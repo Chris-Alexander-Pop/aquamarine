@@ -177,6 +177,7 @@ namespace Aquamarine {
             bool                                           async       = false; // PAGE_FLIP_ASYNC
             uint64_t                                       commitID    = 0;
             bool                                           resultReady = true;
+            uint64_t                                       armedAtNs   = 0; // steady_clock ns, 0 when disarmed
 
             struct {
                 bool         valid = false;

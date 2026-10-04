@@ -5,6 +5,7 @@ This branch tracks [hyprwm/aquamarine](https://github.com/hyprwm/aquamarine) `ma
 | Commit | Summary |
 |--------|---------|
 | `drm: guard async commit emit during teardown` | Upstream null-checks connectors in `flushAsyncCommitEvents`. This still skips empty connector SPs on VT switch, skips the commit signal when the connector is disconnected, and `lock()`s the backend in the idle callback so it does not run during teardown. |
+| `drm: drop a cross-GPU blit instead of waiting on the other GPU's fence` | Explicit client fences are polled on the CPU. A fence that does not signal is a dropped frame, not an `eglWaitSync` on the scanout EGL display. Import of the other GPU's tiling is skipped. A page flip in flight for more than a second is dropped so later commits can proceed. The teardown guard above is unchanged. |
 
 ## Updating from upstream
 
