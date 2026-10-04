@@ -10,6 +10,8 @@
 #include "FormatUtils.hpp"
 #include <aquamarine/allocator/GBM.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
+#include <poll.h>
+#include <cerrno>
 
 using namespace Aquamarine;
 using namespace Hyprutils::Memory;
@@ -535,7 +537,12 @@ void CDRMRenderer::initContext() {
 
     backend->log(AQ_LOG_DEBUG, std::format("Creating CDRMRenderer on gpu {}", gpuName));
     backend->log(AQ_LOG_DEBUG, std::format("Using: {}", (char*)glGetString(GL_VERSION)));
-    backend->log(AQ_LOG_DEBUG, std::format("Vendor: {}", (char*)glGetString(GL_VENDOR)));
+    const char* vendorStr = (const char*)glGetString(GL_VENDOR);
+    backend->log(AQ_LOG_DEBUG, std::format("Vendor: {}", vendorStr ? vendorStr : ""));
+    if (vendorStr && strstr(vendorStr, "NVIDIA"))
+        importVendor = eImportVendor::Nvidia;
+    else if (vendorStr && strstr(vendorStr, "Intel"))
+        importVendor = eImportVendor::Intel;
     backend->log(AQ_LOG_DEBUG, std::format("Renderer: {}", (char*)glGetString(GL_RENDERER)));
     backend->log(AQ_LOG_DEBUG, std::format("Supported context extensions: ({}) {}", std::count(EGLEXTENSIONS.begin(), EGLEXTENSIONS.end(), ' '), EGLEXTENSIONS));
 
@@ -683,6 +690,18 @@ EGLImageKHR CDRMRenderer::createEGLImage(const SDMABUFAttrs& attrs) {
     TRACE(backend->log(AQ_LOG_TRACE,
                        std::format("EGL: createEGLImage: size {} with format {} and modifier 0x{:x} : {}", attrs.size, fourccToName(attrs.format), attrs.modifier,
                                    drmModifierToName(attrs.modifier))));
+
+    // Block-linear on the other GPU returns EGL_BAD_MATCH, and some driver versions sit in the import.
+    // The blit caller reads those buffers on the render GPU instead.
+    if (attrs.modifier != DRM_FORMAT_MOD_INVALID && attrs.modifier != DRM_FORMAT_MOD_LINEAR) {
+        const uint64_t modifierVendor = attrs.modifier >> 56;
+        const bool     foreign        = (importVendor == eImportVendor::Intel && modifierVendor == DRM_FORMAT_MOD_VENDOR_NVIDIA) ||
+            (importVendor == eImportVendor::Nvidia && modifierVendor == DRM_FORMAT_MOD_VENDOR_INTEL);
+        if (foreign) {
+            backend->log(AQ_LOG_DEBUG, std::format("EGL: skip import of modifier 0x{:x}, other GPU's tiling", attrs.modifier));
+            return EGL_NO_IMAGE_KHR;
+        }
+    }
 
     struct {
         EGLint fd;
@@ -954,8 +973,27 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     }
 
     if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD)) {
-        // wait on a provided explicit fence
-        waitOnSync(waitFD);
+        // Poll the sync_file on the CPU. eglWaitSync on this EGL display inserts the
+        // wait into the scanout GPU's queue. An NVIDIA client fence waited on Intel
+        // can sit there forever, so the page flip never completes and every later
+        // commit is rejected.
+        pollfd pfd{};
+        pfd.fd     = waitFD;
+        pfd.events = POLLIN;
+        int ready  = 0;
+        do {
+            ready = poll(&pfd, 1, 500);
+        } while (ready < 0 && errno == EINTR);
+
+        if (ready < 0) {
+            if (primaryRenderer && primaryRenderer.get() != this)
+                primaryRenderer->waitOnSync(waitFD);
+            else
+                waitOnSync(waitFD);
+        } else if (ready == 0 || !(pfd.revents & (POLLIN | POLLHUP))) {
+            backend->log(AQ_LOG_ERROR, "EGL (blit): explicit fence did not signal, dropping frame");
+            return {};
+        }
     }
 
     // firstly, get a texture from the from buffer
@@ -994,8 +1032,16 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
 
         if (!intermediateBuf.empty() && primaryRenderer) {
             // Note: this might modify from's output attachment
-            primaryRenderer->readBuffer(from, intermediateBuf);
+            if (!primaryRenderer->readBuffer(from, intermediateBuf)) {
+                backend->log(AQ_LOG_ERROR, "EGL (blit): failed to read the source buffer on the render GPU");
+                return {};
+            }
         }
+    }
+
+    if (!fromTex || (!fromTex->image && intermediateBuf.empty())) {
+        backend->log(AQ_LOG_ERROR, "EGL (blit): source buffer could not be imported");
+        return {};
     }
 
     TRACE(backend->log(AQ_LOG_TRACE,

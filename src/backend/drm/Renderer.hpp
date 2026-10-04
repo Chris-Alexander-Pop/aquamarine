@@ -162,6 +162,7 @@ namespace Aquamarine {
         } egl;
 
         CGLTex                                        glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
+        // false when the buffer could not be imported on this GPU
         bool readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format = GL_RGBA, uint32_t stride = 0);
 
         Hyprutils::Memory::CWeakPointer<CDRMRenderer> self;
@@ -182,6 +183,14 @@ namespace Aquamarine {
         bool                                                  initDRMFormats();
         std::optional<std::vector<std::pair<uint64_t, bool>>> getModsForFormat(EGLint format);
         bool                                                  hasModifiers = false;
+
+        enum class eImportVendor : uint8_t {
+            Unknown,
+            Nvidia,
+            Intel,
+        };
+        eImportVendor                                         importVendor = eImportVendor::Unknown;
+
         void                                                  useProgram(GLuint prog);
         GLuint                                                m_currentProgram = 0;
 
