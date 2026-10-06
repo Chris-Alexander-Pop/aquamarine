@@ -101,8 +101,11 @@ namespace Aquamarine {
             std::optional<int> syncFD;
         };
 
+        // damage is top-left buffer pixels. Null or empty copies the whole buffer.
         SBlitResult blit(Hyprutils::Memory::CSharedPointer<IBuffer> from, Hyprutils::Memory::CSharedPointer<IBuffer> to,
-                         Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1);
+                         Hyprutils::Memory::CSharedPointer<CDRMRenderer> primaryRenderer, int waitFD = -1, const Hyprutils::Math::CRegion* damage = nullptr);
+        // True when this GPU can render into an imported dmabuf (used to probe cross-GPU scanout).
+        bool        canRenderTo(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
         // can't be a SP<> because we call it from buf's ctor...
         void clearBuffer(IBuffer* buf);
 

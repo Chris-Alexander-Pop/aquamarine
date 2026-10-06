@@ -6,12 +6,15 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "Math.hpp"
+#include "MgpuCopy.hpp"
 #include "Shared.hpp"
 #include "FormatUtils.hpp"
 #include <aquamarine/allocator/GBM.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <poll.h>
 #include <cerrno>
+#include <cmath>
+#include <vector>
 
 using namespace Aquamarine;
 using namespace Hyprutils::Memory;
@@ -953,7 +956,44 @@ void CDRMRenderer::clearBuffer(IBuffer* buf) {
     proc.eglDestroyImageKHR(egl.display, rboImage);
 }
 
-CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, SP<CDRMRenderer> primaryRenderer, int waitFD) {
+bool CDRMRenderer::canRenderTo(SP<IBuffer> buf) {
+    if (!buf || !buf->dmabuf().success)
+        return false;
+    if (!proc.glEGLImageTargetRenderbufferStorageOES || !proc.eglDestroyImageKHR)
+        return false;
+
+    CEglContextGuard eglContext(*this);
+
+    const auto image = createEGLImage(buf->dmabuf());
+    if (image == EGL_NO_IMAGE_KHR)
+        return false;
+
+    GLuint rbo = 0, fbo = 0;
+    GLCALL(glGenRenderbuffers(1, &rbo));
+    GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, rbo));
+    GLCALL(proc.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, (GLeglImageOES)image));
+    GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));
+
+    GLCALL(glGenFramebuffers(1, &fbo));
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, fbo));
+    GLCALL(glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo));
+
+    const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (ok) {
+        glClearColor(0.F, 0.F, 0.F, 1.F);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+    }
+
+    GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+    GLCALL(glBindRenderbuffer(GL_RENDERBUFFER, 0));
+    GLCALL(glDeleteFramebuffers(1, &fbo));
+    GLCALL(glDeleteRenderbuffers(1, &rbo));
+    proc.eglDestroyImageKHR(egl.display, image);
+    return ok;
+}
+
+CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, SP<CDRMRenderer> primaryRenderer, int waitFD, const CRegion* damage) {
     if (!from || !to) {
         backend->log(AQ_LOG_ERROR, "EGL (blit): null source or destination buffer");
         return {};
@@ -990,50 +1030,26 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
         }
     }
 
-    // firstly, get a texture from the from buffer
-    // if it has an attachment, use that
-    // both from and to have the same AQ_ATTACHMENT_DRM_RENDERER_DATA.
-    // Those buffers always come from different swapchains, so it's OK.
-
-    WP<CGLTex>         fromTex;
-    const auto&        fromDma = from->dmabuf();
-    std::span<uint8_t> intermediateBuf;
+    // Import the source on this GPU. A failed import used to glReadPixels the frame on the
+    // render GPU and upload it here. That copy runs through the CPU. Drop the frame instead.
+    WP<CGLTex> fromTex;
     {
         auto attachment = from->attachments.get<CDRMRendererBufferInputAttachment>();
-        if (attachment && attachment->renderer == self) {
+        if (attachment && attachment->renderer == self && attachment->tex && attachment->tex->image) {
             TRACE(backend->log(AQ_LOG_TRACE, "EGL (blit): From attachment found"));
-            fromTex         = attachment->tex;
-            intermediateBuf = attachment->intermediateBuf;
+            fromTex = attachment->tex;
         }
 
-        if ((!fromTex || !fromTex->image) && intermediateBuf.empty()) {
+        if (!fromTex || !fromTex->image) {
             backend->log(AQ_LOG_DEBUG, "EGL (blit): No attachment in from, creating a new image");
 
             attachment = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from), std::vector<uint8_t>());
             from->attachments.add(attachment);
-
-            if (!attachment->tex->image && primaryRenderer) {
-                backend->log(AQ_LOG_DEBUG, "EGL (blit): Failed to create image from source buffer directly, allocating intermediate buffer");
-                static_assert(PIXEL_BUFFER_FORMAT == GL_RGBA); // If the pixel buffer format changes, the below size calculation probably needs to as well.
-                attachment->intermediateBuf.resize(fromDma.size.x * fromDma.size.y * 4);
-                intermediateBuf         = attachment->intermediateBuf;
-                attachment->tex->target = GL_TEXTURE_2D;
-                GLCALL(glGenTextures(1, &attachment->tex->texid));
-            }
-
             fromTex = attachment->tex;
-        }
-
-        if (!intermediateBuf.empty() && primaryRenderer) {
-            // Note: this might modify from's output attachment
-            if (!primaryRenderer->readBuffer(from, intermediateBuf)) {
-                backend->log(AQ_LOG_ERROR, "EGL (blit): failed to read the source buffer on the render GPU");
-                return {};
-            }
         }
     }
 
-    if (!fromTex || (!fromTex->image && intermediateBuf.empty())) {
+    if (!fromTex || !fromTex->image) {
         backend->log(AQ_LOG_ERROR, "EGL (blit): source buffer could not be imported");
         return {};
     }
@@ -1097,8 +1113,42 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
 
     TRACE(backend->log(AQ_LOG_TRACE, std::format("EGL (blit): fbo {} rbo {}", fboID, rboID)));
 
-    glClearColor(0.77F, 0.F, 0.74F, 1.F);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Damage rects are top-left. GL scissors are bottom-left. A region that covers the
+    // buffer, or no region at all, copies the whole frame. A scissor that clips to
+    // nothing falls back to the full copy so the destination is not left blank.
+    bool                     partial = false;
+    std::vector<SGlScissor>  scissors;
+    if (damage && !damage->empty()) {
+        CRegion    clipped = damage->copy().intersect(CBox{{}, toDma.size});
+        const auto ext     = clipped.getExtents();
+        const bool covers  = !clipped.empty() && ext.x <= 0 && ext.y <= 0 && ext.w >= toDma.size.x && ext.h >= toDma.size.y;
+        if (!clipped.empty() && !covers) {
+            std::vector<pixman_box32_t> raw;
+            if (pixman_region32_n_rects(clipped.pixman()) > 16) {
+                raw.push_back(pixman_box32_t{
+                    .x1 = sc<int32_t>(std::floor(ext.x)),
+                    .y1 = sc<int32_t>(std::floor(ext.y)),
+                    .x2 = sc<int32_t>(std::ceil(ext.x + ext.w)),
+                    .y2 = sc<int32_t>(std::ceil(ext.y + ext.h)),
+                });
+            } else
+                raw = clipped.getRects();
+
+            const int bufW = sc<int>(toDma.size.x);
+            const int bufH = sc<int>(toDma.size.y);
+            for (const auto& rect : raw) {
+                const auto box = glScissorForTopLeftRect(rect.x1, rect.y1, rect.x2, rect.y2, bufW, bufH);
+                if (box.draw)
+                    scissors.push_back(box);
+            }
+            partial = !scissors.empty();
+        }
+    }
+
+    if (!partial) {
+        glClearColor(0.77F, 0.F, 0.74F, 1.F);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
 
     // done, let's render the texture to the rbo
     CBox renderBox = {{}, toDma.size};
@@ -1130,12 +1180,13 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     GLCALL(fromTex->setTexParameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST));
     GLCALL(fromTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST));
 
-    if (!intermediateBuf.empty())
-        GLCALL(glTexImage2D(fromTex->target, 0, PIXEL_BUFFER_FORMAT, fromDma.size.x, fromDma.size.y, 0, PIXEL_BUFFER_FORMAT, GL_UNSIGNED_BYTE, intermediateBuf.data()));
-
     useProgram(SHADER.program);
     GLCALL(glDisable(GL_BLEND));
-    GLCALL(glDisable(GL_SCISSOR_TEST));
+    if (partial) {
+        GLCALL(glEnable(GL_SCISSOR_TEST));
+    } else {
+        GLCALL(glDisable(GL_SCISSOR_TEST));
+    }
 
     matrixTranspose(glMtx, glMtx);
     GLCALL(glUniformMatrix3fv(SHADER.proj, 1, GL_FALSE, glMtx));
@@ -1143,7 +1194,15 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     GLCALL(glUniform1i(SHADER.tex, 0));
     GLCALL(glBindVertexArray(SHADER.shaderVao));
 
-    GLCALL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+    if (!partial) {
+        GLCALL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+    } else {
+        for (const auto& box : scissors) {
+            GLCALL(glScissor(box.x, box.y, box.w, box.h));
+            GLCALL(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+        }
+        GLCALL(glDisable(GL_SCISSOR_TEST));
+    }
 
     GLCALL(glBindVertexArray(0));
     GLCALL(fromTex->unbind());

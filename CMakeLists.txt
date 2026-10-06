@@ -162,6 +162,15 @@ add_test(
   COMMAND output "output")
 add_dependencies(tests output)
 
+add_executable(mgpuCopy "tests/MgpuCopy.cpp")
+target_include_directories(mgpuCopy PRIVATE "./src/backend/drm")
+target_link_libraries(mgpuCopy PRIVATE PkgConfig::deps aquamarine)
+add_test(
+  NAME "mgpuCopy"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests
+  COMMAND mgpuCopy "mgpuCopy")
+add_dependencies(tests mgpuCopy)
+
 add_executable(commitThread "tests/CommitThread.cpp")
 target_include_directories(commitThread PRIVATE "./src/backend/drm")
 target_link_libraries(commitThread PRIVATE PkgConfig::deps aquamarine)

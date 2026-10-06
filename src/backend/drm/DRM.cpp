@@ -40,6 +40,7 @@ extern "C" {
 #include "Renderer.hpp"
 #include "OutputTiming.hpp"
 #include "AsyncCommit.hpp"
+#include "MgpuCopy.hpp"
 
 #include <hyprutils/utils/ScopeGuard.hpp>
 using Hyprutils::Utils::CScopeGuard;
@@ -866,6 +867,67 @@ bool Aquamarine::CDRMBackend::shouldBlit() {
     return !!primary;
 }
 
+bool Aquamarine::CDRMBackend::useDirectScanout() {
+    if (!primary || envExplicitlyDisabled("AQ_MGPU_DIRECT_SCANOUT"))
+        return false;
+
+    if (rendererState.directScanoutProbed)
+        return rendererState.directScanout;
+
+    if (!rendererState.allocator || !primary->rendererState.renderer) {
+        backend->log(AQ_LOG_DEBUG, "drm: Direct scanout probe deferred, renderer is not ready");
+        return false;
+    }
+
+    rendererState.directScanoutProbed = true;
+    rendererState.directScanout       = false;
+
+    auto probe = CSwapchain::create(rendererState.allocator, primary.lock());
+    if (!probe) {
+        backend->log(AQ_LOG_ERROR, "drm: Direct scanout probe could not create a swapchain");
+        return false;
+    }
+
+    SSwapchainOptions opt;
+    opt.length       = 1;
+    opt.size         = {64, 64};
+    opt.format       = DRM_FORMAT_XRGB8888;
+    opt.scanout      = true;
+    opt.multigpu     = true;
+    opt.localScanout = true;
+    if (!probe->reconfigure(opt)) {
+        backend->log(AQ_LOG_ERROR, "drm: Direct scanout probe could not allocate a scanout buffer");
+        return false;
+    }
+
+    auto buf = probe->next(nullptr);
+    if (!buf || !primary->rendererState.renderer->canRenderTo(buf)) {
+        backend->log(AQ_LOG_DEBUG, "drm: Render GPU cannot draw into a scanout-GPU buffer, keeping the blit");
+        return false;
+    }
+
+    rendererState.directScanout = true;
+    backend->log(AQ_LOG_DEBUG, "drm: Render GPU can draw into the scanout buffer, skipping the cross-GPU copy");
+    return true;
+}
+
+void Aquamarine::CDRMBackend::configureOutputSwapchain(SP<CDRMOutput> output) {
+    auto       primaryBackend = primary ? primary : self;
+    const bool direct         = useDirectScanout();
+    auto       alloc          = (direct && rendererState.allocator) ? rendererState.allocator : backend->primaryAllocator;
+
+    output->swapchain    = CSwapchain::create(alloc, primaryBackend.lock());
+    output->directScanout = direct;
+
+    SSwapchainOptions opt;
+    opt.length        = 0;
+    opt.scanout       = true;
+    opt.multigpu      = !!primary;
+    opt.localScanout  = direct;
+    opt.scanoutOutput = output;
+    output->swapchain->reconfigure(opt);
+}
+
 bool Aquamarine::CDRMBackend::initMgpu() {
     if (!rendererRequired)
         return true;
@@ -1564,6 +1626,9 @@ void Aquamarine::CDRMBackend::onReady() {
         }
     }
 
+    if (!updateSecondaryRendererState())
+        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to initialize renderer state for {}", gpu->path));
+
     for (auto const& c : connectors) {
         backend->log(AQ_LOG_DEBUG, std::format("drm: onReady: connector {}", c->id));
         if (!c->output)
@@ -1571,18 +1636,10 @@ void Aquamarine::CDRMBackend::onReady() {
 
         backend->log(AQ_LOG_DEBUG, std::format("drm: onReady: connector {} has output name {}", c->id, c->output->name));
 
-        // swapchain has to be created here because allocator is absent in connect if not ready
-        auto primaryBackend  = primary ? primary : self;
-        c->output->swapchain = CSwapchain::create(backend->primaryAllocator, primaryBackend.lock());
-        c->output->swapchain->reconfigure(SSwapchainOptions{.length = 0, .scanout = true, .multigpu = !!primary, .scanoutOutput = c->output}); // mark the swapchain for scanout
+        configureOutputSwapchain(c->output);
         c->output->needsFrame = true;
 
         backend->events.newOutput.emit(SP<IOutput>(c->output));
-    }
-
-    if (!updateSecondaryRendererState()) {
-        backend->log(AQ_LOG_ERROR, std::format("drm: Failed to initialize renderer state for {}", gpu->path));
-        return;
     }
 }
 
@@ -2129,9 +2186,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
         return;
     }
 
-    auto primaryBackend = backend->primary ? backend->primary : backend;
-    output->swapchain   = CSwapchain::create(backend->backend->primaryAllocator, primaryBackend.lock());
-    output->swapchain->reconfigure(SSwapchainOptions{.length = 0, .scanout = true, .multigpu = !!backend->primary, .scanoutOutput = output}); // mark the swapchain for scanout
+    backend->configureOutputSwapchain(output);
     output->needsFrame = true;
     backend->backend->events.newOutput.emit(SP<IOutput>(output));
     output->scheduleFrame(IOutput::AQ_SCHEDULE_NEW_CONNECTOR);
@@ -2354,12 +2409,57 @@ Aquamarine::CDRMOutput::~CDRMOutput() {
 void Aquamarine::CDRMOutput::releaseMgpuResources() {
     mgpu.swapchain.reset();
     mgpu.cursorSwapchain.reset();
+    mgpu.primed = 0;
 
     if (swapchain) {
         auto options   = swapchain->currentOptions();
         options.length = 0;
         swapchain->reconfigure(options);
     }
+}
+
+SP<CDRMFB> Aquamarine::CDRMOutput::takeDirectFramebuffer(SP<IBuffer> buffer) {
+    if (!directScanout || !buffer || !swapchain || !swapchain->contains(buffer))
+        return nullptr;
+
+    auto fb = CDRMFB::create(buffer, backend, nullptr);
+    if (fb && !fb->dead)
+        return fb;
+
+    if (buffer->attachments.has<CDRMBufferUnimportable>())
+        buffer->attachments.removeByType<CDRMBufferUnimportable>();
+
+    if (!backend || !backend->backend) {
+        directScanout = false;
+        return nullptr;
+    }
+
+    backend->backend->log(AQ_LOG_ERROR, "drm: Scanout GPU rejected the rendered buffer, falling back to a blit");
+    directScanout = false;
+
+    auto options         = swapchain->currentOptions();
+    options.localScanout = false;
+    options.multigpu     = true;
+    auto primaryBackend  = backend->primary ? backend->primary : backend;
+    swapchain            = CSwapchain::create(backend->backend->primaryAllocator, primaryBackend.lock());
+    if (options.length > 0 && !swapchain->reconfigure(options))
+        backend->backend->log(AQ_LOG_ERROR, "drm: Failed to rebuild the render swapchain after direct scanout failed");
+
+    return nullptr;
+}
+
+const CRegion* Aquamarine::CDRMOutput::scanoutBlitRegion(const COutputState::SInternalState& state, size_t chainLength, bool& skip) {
+    // skip: the frame did not change and every scanout buffer already holds a full image.
+    // The caller still acquires the next buffer so this chain stays aligned with the render swapchain.
+    const bool haveDamage = (state.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE) && state.buffer;
+    const bool empty      = !state.buffer || state.damage.empty();
+    const bool covers     = state.buffer && !state.damage.empty() && damageCoversBuffer(state.damage, state.buffer->size);
+    const auto decision   = decideMgpuCopy(haveDamage, empty, covers, mgpu.primed, chainLength);
+
+    skip = decision.skip;
+    if (decision.skip || decision.full)
+        return nullptr;
+    return &state.damage;
 }
 
 bool Aquamarine::CDRMOutput::commit() {
@@ -2406,8 +2506,13 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
     data.cursorHotspot = cursorHotspot;
     data.cursorVisible = cursorVisible;
 
-    SP<CDRMFB> drmFB;
-    if (backend->shouldBlit()) {
+    SP<CDRMFB> drmFB = STATE.buffer ? takeDirectFramebuffer(STATE.buffer) : nullptr;
+    if (!drmFB && backend->shouldBlit()) {
+        if (!STATE.buffer) {
+            backend->log(AQ_LOG_ERROR, "drm: Asynchronous blit has no source buffer");
+            return false;
+        }
+
         if (!backend->rendererState.renderer) {
             backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for asynchronous blitting, initializing");
             if (!backend->initMgpu() || !backend->rendererState.renderer || !backend->rendererState.allocator) {
@@ -2438,46 +2543,63 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
             return false;
         }
 
-        if (!mgpu.swapchain->reconfigure(options)) {
-            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain failed reconfiguring");
+        bool           skip   = false;
+        const CRegion* region = scanoutBlitRegion(STATE, options.length, skip);
+
+        if (!drmFB) {
+            if (!mgpu.swapchain->reconfigure(options)) {
+                backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain failed reconfiguring");
+                return false;
+            }
+
+            const auto NEW_BUFFER = mgpu.swapchain->next(nullptr);
+            if (!NEW_BUFFER) {
+                backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain has no buffer");
+                return false;
+            }
+            mgpuAcquired = true;
+
+            if (skip) {
+                data.outputState.explicitInFence = -1;
+                drmFB                            = CDRMFB::create(NEW_BUFFER, backend, nullptr);
+            } else {
+                SP<CDRMRenderer> primaryRenderer;
+                if (backend->primary)
+                    primaryRenderer = backend->primary->rendererState.renderer;
+                const auto BLIT = backend->rendererState.renderer->blit(STATE.buffer, NEW_BUFFER, primaryRenderer,
+                                                                        (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1, region);
+                if (!BLIT.success) {
+                    backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but blitting failed");
+                    return false;
+                }
+                if (!region)
+                    mgpu.primed++;
+
+                static const bool NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+                if (!BLIT.syncFD || NO_EXPLICIT || !supportsExplicit) {
+                    requiresSync = true;
+                    return false;
+                }
+
+                const int DUPLICATED_FENCE = fcntl(*BLIT.syncFD, F_DUPFD_CLOEXEC, 0);
+                if (DUPLICATED_FENCE < 0) {
+                    backend->log(AQ_LOG_ERROR, std::format("drm: Failed to duplicate asynchronous mGPU fence: {}", strerror(errno)));
+                    return false;
+                }
+
+                mgpuFence                        = Hyprutils::OS::CFileDescriptor{DUPLICATED_FENCE};
+                data.outputState.explicitInFence = mgpuFence.get();
+
+                drmFB = CDRMFB::create(NEW_BUFFER, backend, nullptr);
+            }
+        }
+    } else if (!drmFB) {
+        if (!STATE.buffer) {
+            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit has no buffer");
             return false;
         }
-
-        const auto NEW_BUFFER = mgpu.swapchain->next(nullptr);
-        if (!NEW_BUFFER) {
-            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but the mGPU swapchain has no buffer");
-            return false;
-        }
-        mgpuAcquired = true;
-
-        SP<CDRMRenderer> primaryRenderer;
-        if (backend->primary)
-            primaryRenderer = backend->primary->rendererState.renderer;
-        const auto BLIT = backend->rendererState.renderer->blit(STATE.buffer, NEW_BUFFER, primaryRenderer,
-                                                                (STATE.committed & COutputState::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
-        if (!BLIT.success) {
-            backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit requires blit, but blitting failed");
-            return false;
-        }
-
-        static const bool NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
-        if (!BLIT.syncFD || NO_EXPLICIT || !supportsExplicit) {
-            requiresSync = true;
-            return false;
-        }
-
-        const int DUPLICATED_FENCE = fcntl(*BLIT.syncFD, F_DUPFD_CLOEXEC, 0);
-        if (DUPLICATED_FENCE < 0) {
-            backend->log(AQ_LOG_ERROR, std::format("drm: Failed to duplicate asynchronous mGPU fence: {}", strerror(errno)));
-            return false;
-        }
-
-        mgpuFence                        = Hyprutils::OS::CFileDescriptor{DUPLICATED_FENCE};
-        data.outputState.explicitInFence = mgpuFence.get();
-
-        drmFB = CDRMFB::create(NEW_BUFFER, backend, nullptr);
-    } else
         drmFB = CDRMFB::create(STATE.buffer, backend, nullptr);
+    }
 
     if (!drmFB || drmFB->dead) {
         backend->log(AQ_LOG_ERROR, "drm: Asynchronous commit buffer failed to import to KMS");
@@ -2665,6 +2787,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
         if (blittedFB)
             drmFB = blittedFB;
+        else if (auto direct = takeDirectFramebuffer(STATE.buffer))
+            drmFB = direct;
         else if (backend->shouldBlit()) {
             if (!backend->rendererState.renderer) {
                 backend->backend->log(AQ_LOG_DEBUG, "drm: No renderer attached to backend when required for blitting, initializing");
@@ -2691,37 +2815,55 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             OPTIONS.scanout  = true;
             if (OPTIONS.length == 0) // releaseMgpuResources() cleared the swapchain and we committed without updating it.
                 OPTIONS.length = 2;
-            if (!mgpu.swapchain->reconfigure(OPTIONS)) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
-                return false;
+
+            const auto& CURRENT = mgpu.swapchain->currentOptions();
+            if (CURRENT.length > 0 && (CURRENT.size != OPTIONS.size || CURRENT.format != OPTIONS.format || CURRENT.length != OPTIONS.length))
+                mgpu.primed = 0;
+
+            bool           skip   = false;
+            const CRegion* region = scanoutBlitRegion(STATE, OPTIONS.length, skip);
+
+            if (!drmFB) {
+                if (!mgpu.swapchain->reconfigure(OPTIONS)) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain failed reconfiguring");
+                    return false;
+                }
+
+                auto NEWAQBUF = mgpu.swapchain->next(nullptr);
+                if (!NEWAQBUF) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
+                    return false;
+                }
+
+                if (skip) {
+                    data.outputState.explicitInFence = -1;
+                    drmFB                            = CDRMFB::create(NEWAQBUF, backend, nullptr);
+                } else {
+                    SP<Aquamarine::CDRMRenderer> primaryRenderer;
+                    if (backend->primary)
+                        primaryRenderer = backend->primary->rendererState.renderer;
+                    auto blitResult = backend->rendererState.renderer->blit(
+                        STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1,
+                        region);
+                    if (!blitResult.success) {
+                        backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+                        return false;
+                    }
+                    if (!region)
+                        mgpu.primed++;
+
+                    // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
+                    // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
+                    static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+                    if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
+                        data.outputState.explicitInFence = blitResult.syncFD.value();
+                    else
+                        data.outputState.explicitInFence = -1;
+
+                    drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
+                }
             }
-
-            auto NEWAQBUF = mgpu.swapchain->next(nullptr);
-            if (!NEWAQBUF) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but the mgpu swapchain has no buffer");
-                return false;
-            }
-
-            SP<Aquamarine::CDRMRenderer> primaryRenderer;
-            if (backend->primary)
-                primaryRenderer = backend->primary->rendererState.renderer;
-            auto blitResult = backend->rendererState.renderer->blit(
-                STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
-            if (!blitResult.success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
-                return false;
-            }
-
-            // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
-            // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
-            static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
-            if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
-                data.outputState.explicitInFence = blitResult.syncFD.value();
-            else
-                data.outputState.explicitInFence = -1;
-
-            drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
-        } else
+        } else if (!drmFB)
             drmFB = CDRMFB::create(STATE.buffer, backend, nullptr); // will return attachment if present
 
         if (!drmFB) {
