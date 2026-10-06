@@ -11,7 +11,7 @@ namespace Aquamarine {
     struct SAllocatorBufferParams {
         Hyprutils::Math::Vector2D size;
         uint32_t                  format  = DRM_FORMAT_INVALID;
-        bool                      scanout = false, cursor = false, multigpu = false;
+        bool                      scanout = false, cursor = false, multigpu = false, localScanout = false;
     };
 
     enum eAllocatorType {

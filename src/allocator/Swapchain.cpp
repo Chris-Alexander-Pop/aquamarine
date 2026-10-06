@@ -77,7 +77,12 @@ bool Aquamarine::CSwapchain::fullReconfigure(const SSwapchainOptions& options_) 
 
     for (size_t i = 0; i < options_.length; ++i) {
         auto buf = allocator->acquire(
-            SAllocatorBufferParams{.size = options_.size, .format = options_.format, .scanout = options_.scanout, .cursor = options_.cursor, .multigpu = options_.multigpu},
+            SAllocatorBufferParams{.size     = options_.size,
+                                   .format   = options_.format,
+                                   .scanout  = options_.scanout,
+                                   .cursor   = options_.cursor,
+                                   .multigpu = options_.multigpu,
+                                   .localScanout = options_.localScanout},
             self.lock());
         if (!buf) {
             allocator->getBackend()->log(AQ_LOG_ERROR, "Swapchain: Failed acquiring a buffer");
@@ -105,7 +110,12 @@ bool Aquamarine::CSwapchain::resize(size_t newSize) {
     } else {
         while (buffers.size() < newSize) {
             auto buf = allocator->acquire(
-                SAllocatorBufferParams{.size = options.size, .format = options.format, .scanout = options.scanout, .cursor = options.cursor, .multigpu = options.multigpu},
+                SAllocatorBufferParams{.size     = options.size,
+                                       .format   = options.format,
+                                       .scanout  = options.scanout,
+                                       .cursor   = options.cursor,
+                                       .multigpu = options.multigpu,
+                                       .localScanout = options.localScanout},
                 self.lock());
             if (!buf) {
                 allocator->getBackend()->log(AQ_LOG_ERROR, "Swapchain: Failed acquiring a buffer");
