@@ -269,6 +269,9 @@ namespace Aquamarine {
         bool commitState(bool onlyTest = false);
         bool prepareAsyncCommitData(const COutputState::CSnapshot& snapshot, SDRMConnectorCommitData& data, Hyprutils::OS::CFileDescriptor& mgpuFence, bool& mgpuAcquired,
                                     bool& requiresSync);
+        // Null when this buffer should be copied. A previous scanout FB when the frame did not change.
+        Hyprutils::Memory::CSharedPointer<CDRMFB> takeDirectFramebuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buffer);
+        const Hyprutils::Math::CRegion*           scanoutBlitRegion(const COutputState::SInternalState& state, size_t chainLength, bool& skip);
 
         Hyprutils::Memory::CWeakPointer<CDRMBackend>                 backend;
         Hyprutils::Memory::CSharedPointer<SDRMConnector>             connector;
@@ -279,7 +282,10 @@ namespace Aquamarine {
         struct {
             Hyprutils::Memory::CSharedPointer<CSwapchain> swapchain;
             Hyprutils::Memory::CSharedPointer<CSwapchain> cursorSwapchain;
+            uint32_t                                      primed = 0; // full copies done, so later blits can trust the back buffer
         } mgpu;
+
+        bool directScanout = false;
 
         bool                                                               lastCommitNoBuffer = true;
         uint64_t                                                           asyncOwnerID = 0, pendingAsyncCommit = 0;
@@ -506,6 +512,8 @@ namespace Aquamarine {
         bool     updateSecondaryRendererState(DRMFBList* retired = nullptr);
         bool     grabFormats();
         bool     shouldBlit();
+        bool     useDirectScanout();
+        void     configureOutputSwapchain(Hyprutils::Memory::CSharedPointer<CDRMOutput> output);
         void     scanConnectors();
         void     scanLeases();
         void     restoreAfterVT();
@@ -529,6 +537,8 @@ namespace Aquamarine {
         struct {
             Hyprutils::Memory::CSharedPointer<IAllocator>   allocator;
             Hyprutils::Memory::CSharedPointer<CDRMRenderer> renderer; // may be null if creation fails
+            bool                                            directScanout       = false;
+            bool                                            directScanoutProbed = false;
         } rendererState;
 
         bool                                                          rendererRequired = true;

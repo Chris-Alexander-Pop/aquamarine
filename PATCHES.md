@@ -6,6 +6,8 @@ This branch tracks [hyprwm/aquamarine](https://github.com/hyprwm/aquamarine) `ma
 |--------|---------|
 | `drm: guard async commit emit during teardown` | Upstream null-checks connectors in `flushAsyncCommitEvents`. This still skips empty connector SPs on VT switch, skips the commit signal when the connector is disconnected, and `lock()`s the backend in the idle callback so it does not run during teardown. |
 | `drm: drop a cross-GPU blit instead of waiting on the other GPU's fence` | Explicit client fences are polled on the CPU. A fence that does not signal is a dropped frame, not an `eglWaitSync` on the scanout EGL display. Import of the other GPU's tiling is skipped. A page flip in flight for more than a second is dropped so later commits can proceed. The teardown guard above is unchanged. |
+| `drm: render into the scanout buffer when the render GPU can` | Secondary outputs allocate their swapchain on the scanout GPU (`localScanout`, linear + scanout usage). If the render GPU can bind that buffer, KMS flips it and the copy is skipped. `AQ_MGPU_DIRECT_SCANOUT=0` keeps the blit. A failed import falls back to the blit and rebuilds the swapchain on the render GPU. |
+| `drm: scissor multi-GPU blits and drop the CPU readback` | Remaining blits copy only the damage Hyprland committed, after one full frame per swapchain slot. An unchanged frame acquires the next scanout buffer and does not copy. A source the scanout GPU cannot import is a dropped frame, not a `glReadPixels` upload. |
 
 ## Updating from upstream
 

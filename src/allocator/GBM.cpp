@@ -71,8 +71,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
     size         = attrs.size;
 
     const bool CURSOR           = params.cursor && params.scanout;
-    const bool MULTIGPU         = params.multigpu && params.scanout;
-    const bool EXPLICIT_SCANOUT = params.scanout && swapchain->currentOptions().scanoutOutput && !params.multigpu;
+    const bool LOCAL_SCANOUT    = params.localScanout && params.scanout;
+    const bool MULTIGPU         = (params.multigpu && params.scanout) || LOCAL_SCANOUT;
+    const bool EXPLICIT_SCANOUT = params.scanout && swapchain->currentOptions().scanoutOutput && !params.multigpu && !LOCAL_SCANOUT;
 
     TRACE(allocator->backend->log(AQ_LOG_TRACE,
                                   std::format("GBM: Allocating a buffer: size {}, format {}, cursor: {}, multigpu: {}, scanout: {}", attrs.size, fourccToName(attrs.format), CURSOR,
@@ -163,7 +164,9 @@ Aquamarine::CGBMBuffer::CGBMBuffer(const SAllocatorBufferParams& params, Hypruti
     }
 
     uint32_t flags = GBM_BO_USE_RENDERING;
-    if (params.scanout && !MULTIGPU)
+    // A buffer that lives on the scanout GPU needs scanout usage so KMS can flip it.
+    // The plain multigpu path stays without that flag: those buffers are allocated on the render GPU.
+    if (params.scanout && (!MULTIGPU || LOCAL_SCANOUT))
         flags |= GBM_BO_USE_SCANOUT;
 
     uint64_t modifier = DRM_FORMAT_MOD_INVALID;
